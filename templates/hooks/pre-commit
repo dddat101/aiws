@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -e
+AI_SYNC_SCRIPT="${AI_WORKSPACE_DIR:-${HOME}/.ai_workspaces/$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")}/.ai/scripts/sync_ai_kb.sh"
+if [[ -x "${AI_SYNC_SCRIPT}" ]]; then
+    "${AI_SYNC_SCRIPT}" --cached
+fi

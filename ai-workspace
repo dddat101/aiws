@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+# ai-workspace - Unified Deep CLI Module for AI Workspace Lifecycle
+set -Eeuo pipefail
+
+SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${SCRIPT_PATH}")" && pwd -P)"
+
+# Source internal modules
+if [[ -f "${SCRIPT_DIR}/lib/common.sh" ]]; then
+    LIB_DIR="${SCRIPT_DIR}/lib"
+elif [[ -f "${SCRIPT_DIR}/../lib/common.sh" ]]; then
+    LIB_DIR="${SCRIPT_DIR}/../lib"
+elif [[ -f "${SCRIPT_DIR}/.ai/lib/common.sh" ]]; then
+    LIB_DIR="${SCRIPT_DIR}/.ai/lib"
+else
+    printf "[!] Error: Unable to locate lib/ directory for ai-workspace.\n" >&2
+    exit 1
+fi
+
+source "${LIB_DIR}/common.sh"
+source "${LIB_DIR}/symbol_extractor.sh"
+source "${LIB_DIR}/knowledge_registry.sh"
+source "${LIB_DIR}/workspace_provisioner.sh"
+
+setup_err_trap
+
+usage() {
+    printf "%s\n" \
+        "ai-workspace - Unified Out-of-Tree AI Workspace Management Tool" \
+        "" \
+        "Usage:" \
+        "  ai-workspace [OPTIONS] <COMMAND> [ARGUMENTS...]" \
+        "" \
+        "Commands:" \
+        "  init [target_dir]            Provision Out-of-Tree AI Workspace for target repository" \
+        "  migrate [target_dir]         Upgrade an existing AI Workspace to latest CLI, schema, and hooks" \
+        "  bootstrap <domain> <paths>   Extract symbols and generate domain knowledge skeleton" \
+        "  slice <symbol|file:line>     Extract exact function/struct code block for surgical context reading" \
+        "  refresh-coords [domain]      Auto-heal drifted symbol line numbers across domain files" \
+        "  sync [DIFF_MODE]             Synchronize staleness flags based on Git diff (--cached or commit range)" \
+        "  reindex                      Reconcile and synchronize index.md with all domain files" \
+        "  status                       Display summary of registered domains and verification statuses" \
+        "  help                         Show this help message" \
+        "" \
+        "Options:" \
+        "  -d, --dry-run                Preview actions without modifying files or git state" \
+        "  -h, --help                   Show command help" \
+        "" \
+        "Examples:" \
+        "  ai-workspace init /path/to/my_project" \
+        "  ai-workspace bootstrap net/driver drivers/net/ethernet/core/" \
+        "  ai-workspace slice net_rx_action" \
+        "  ai-workspace refresh-coords net/driver" \
+        "  ai-workspace sync --cached" \
+        "  ai-workspace reindex" \
+        "  ai-workspace status"
+    exit "${1:-0}"
+}
+
+# Helper to render domain document without heredoc
+render_domain_doc() {
+    local domain="$1"
+    local paths="$2"
+    local date_str="$3"
+    local f_structs="$4"
+    local f_callbacks="$5"
+    local f_pub="$6"
+    local f_static="$7"
+
+    printf "# Module: %s\n" "${domain}"
+    printf "**Source paths:** \`%s\`\n" "${paths}"
+    printf "**Last updated:** %s\n" "${date_str}"
+    printf "**Overall Status:** \`[SKELETON - UNVERIFIED]\`\n\n"
+    printf "## 1. Core Execution Flows (Call Graph)\n"
+    printf -- "- \`[STATIC]\` **Initialization Flow / Entry Point:** *(To be documented by agent)*\n\n"
+    printf "## 2. Data Structures & Memory Ownership\n"
+    cat "${f_structs}"
+    printf "\n\n## 3. Branching Points & Function Pointer Callbacks\n"
+    cat "${f_callbacks}"
+    printf "\n\n## 4. Symbol Coordinates\n"
+    printf "### Public API:\n"
+    cat "${f_pub}"
+    printf "\n\n### Internal / Static:\n"
+    cat "${f_static}"
+    printf "\n"
+}
+
+# Global option parsing
+COMMAND=""
+declare -a COMMAND_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--dry-run)
+            export DRY_RUN=true
+            shift
+            ;;
+        -h|--help)
+            if [[ -z "${COMMAND}" ]]; then
+                usage 0
+            else
+                COMMAND_ARGS+=("$1")
+                shift
+            fi
+            ;;
+        --)
+            shift
+            while [[ $# -gt 0 ]]; do
+                COMMAND_ARGS+=("$1")
+                shift
+            done
+            break
+            ;;
+        -*)
+            if [[ -z "${COMMAND}" ]]; then
+                log_error "Unknown option: $1"
+                usage 1
+            else
+                COMMAND_ARGS+=("$1")
+                shift
+            fi
+            ;;
+        *)
+            if [[ -z "${COMMAND}" ]]; then
+                COMMAND="$1"
+            else
+                COMMAND_ARGS+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "${COMMAND}" ]]; then
+    usage 1
+fi
+
+# Command Dispatcher
+case "${COMMAND}" in
+    init)
+        target_dir=""
+        for arg in "${COMMAND_ARGS[@]}"; do
+            if [[ "${arg}" == "-h" || "${arg}" == "--help" ]]; then
+                printf "Usage: ai-workspace init [OPTIONS] [target_codebase_directory]\n\n"
+                printf "Provisions Out-of-Tree AI Workspace for target repository.\n"
+                exit 0
+            elif [[ "${arg}" == "-d" || "${arg}" == "--dry-run" ]]; then
+                export DRY_RUN=true
+            elif [[ -z "${target_dir}" && "${arg}" != -* ]]; then
+                target_dir="${arg}"
+            fi
+        done
+        resolve_workspace_env "${target_dir}"
+        provision_workspace "${SCRIPT_DIR}"
+        ;;
+
+    migrate)
+        target_dir=""
+        for arg in "${COMMAND_ARGS[@]}"; do
+            if [[ "${arg}" == "-h" || "${arg}" == "--help" ]]; then
+                printf "Usage: ai-workspace migrate [OPTIONS] [target_codebase_directory]\n\n"
+                printf "Upgrades an existing AI Workspace to the latest CLI engine, schema, skills, and hooks without losing domain knowledge.\n"
+                exit 0
+            elif [[ "${arg}" == "-d" || "${arg}" == "--dry-run" ]]; then
+                export DRY_RUN=true
+            elif [[ -z "${target_dir}" && "${arg}" != -* ]]; then
+                target_dir="${arg}"
+            fi
+        done
+        resolve_workspace_env "${target_dir}"
+        migrate_workspace "${SCRIPT_DIR}"
+        ;;
+
+    bootstrap)
+        local_args=()
+        for arg in "${COMMAND_ARGS[@]}"; do
+            if [[ "${arg}" == "-h" || "${arg}" == "--help" ]]; then
+                printf "Usage: ai-workspace bootstrap [OPTIONS] <domain_name> <path_1> [path_2 ...]\n\n"
+                printf "Extracts symbols and generates domain knowledge skeleton.\n"
+                exit 0
+            elif [[ "${arg}" == "-d" || "${arg}" == "--dry-run" ]]; then
+                export DRY_RUN=true
+            elif [[ "${arg}" != -* ]]; then
+                local_args+=("${arg}")
+            fi
+        done
+
+        if [[ ${#local_args[@]} -lt 2 ]]; then
+            log_error "Usage: ai-workspace bootstrap <domain_name> <path_1> [path_2 ...]"
+            exit 1
+        fi
+        domain_name="${local_args[0]}"
+        target_paths=("${local_args[@]:1}")
+
+        resolve_workspace_env ""
+        out_file="${DOMAINS_DIR}/${domain_name}.md"
+        rel_out_file=".ai/domains/${domain_name}.md"
+        today="$(date +%Y-%m-%d)"
+
+        valid_paths=()
+        for p in "${target_paths[@]}"; do
+            if [[ -e "${p}" ]]; then
+                rel_p="$(realpath --relative-to="${CODEBASE_ROOT}" "${p}" 2>/dev/null || printf '%s' "${p#./}")"
+                valid_paths+=("${rel_p#./}")
+            elif [[ -e "${CODEBASE_ROOT}/${p#./}" ]]; then
+                valid_paths+=("${p#./}")
+            fi
+        done
+
+        if [[ ${#valid_paths[@]} -eq 0 ]]; then
+            log_error "No valid paths found from input arguments."
+            exit 1
+        fi
+
+        cd -- "${CODEBASE_ROOT}"
+
+        # Ensure domain directory and symlinks exist
+        if [[ "${DRY_RUN}" == "false" ]]; then
+            mkdir -p "$(dirname -- "${out_file}")"
+            [[ ! -L "${CODEBASE_ROOT}/.ai" && -d "${AI_DIR}" ]] && ln -sfn "${AI_DIR}" "${CODEBASE_ROOT}/.ai"
+            [[ ! -L "${CODEBASE_ROOT}/AGENTS.md" && -f "${EXTERNAL_BASE}/AGENTS.md" ]] && ln -sfn "${EXTERNAL_BASE}/AGENTS.md" "${CODEBASE_ROOT}/AGENTS.md"
+        fi
+
+        tmpdir="$(mktemp -d)" || { log_error "Failed to create secure temporary directory."; exit 1; }
+        trap 'rm -rf -- "${tmpdir}"' EXIT
+
+        tmp_structs="${tmpdir}/structs.txt"
+        tmp_pub_funcs="${tmpdir}/pub_funcs.txt"
+        tmp_static_funcs="${tmpdir}/static_funcs.txt"
+        tmp_callbacks="${tmpdir}/callbacks.txt"
+        touch "${tmp_structs}" "${tmp_pub_funcs}" "${tmp_static_funcs}" "${tmp_callbacks}"
+
+        # Internal Seam: Call Symbol Extractor
+        extract_symbols "${tmp_structs}" "${tmp_pub_funcs}" "${tmp_static_funcs}" "${tmp_callbacks}" "${valid_paths[@]}"
+
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            log_info "[DRY-RUN] Preview of generated domain file for '${domain_name}':"
+            render_domain_doc "${domain_name}" "${valid_paths[*]}" "${today}" \
+                "${tmp_structs}" "${tmp_callbacks}" "${tmp_pub_funcs}" "${tmp_static_funcs}"
+            log_info "[DRY-RUN] Target output path: ${out_file}"
+        else
+            render_domain_doc "${domain_name}" "${valid_paths[*]}" "${today}" \
+                "${tmp_structs}" "${tmp_callbacks}" "${tmp_pub_funcs}" "${tmp_static_funcs}" > "${out_file}"
+            domain_keywords="$(generate_domain_keywords "${tmp_structs}" "${tmp_pub_funcs}" "${tmp_callbacks}" "${valid_paths[*]}")"
+            registry_register_domain "${domain_name}" "${valid_paths[*]}" "${rel_out_file}" "${domain_keywords}"
+            registry_commit_changes "Bootstrap skeleton for domain '${domain_name}'" "${out_file}" "${INDEX_FILE}"
+            log_success "Domain knowledge skeleton created at: ${out_file}"
+            log_info "Suggested Next Prompt: \"Complete knowledge for ${domain_name} in ${rel_out_file} using './.ai/ai-workspace slice', trace core execution flows, and promote to [STATIC].\""
+        fi
+        ;;
+
+    slice)
+        slice_target=""
+        slice_max="160"
+        for arg in "${COMMAND_ARGS[@]}"; do
+            if [[ "${arg}" == "-h" || "${arg}" == "--help" ]]; then
+                printf "Usage: ai-workspace slice <symbol_name | file:line[-end]> [max_lines]\n\n"
+                printf "Extracts the exact function, struct, or class definition block with line numbers.\n"
+                exit 0
+            elif [[ -z "${slice_target}" && "${arg}" != -* ]]; then
+                slice_target="${arg}"
+            elif [[ "${arg}" =~ ^[0-9]+$ ]]; then
+                slice_max="${arg}"
+            fi
+        done
+
+        if [[ -z "${slice_target}" ]]; then
+            log_error "Usage: ai-workspace slice <symbol_name | file:line[-end]> [max_lines]"
+            exit 1
+        fi
+
+        resolve_workspace_env ""
+        cd -- "${CODEBASE_ROOT}"
+        slice_source_entity "${slice_target}" "${slice_max}"
+        ;;
+
+    refresh-coords)
+        target_dom=""
+        for arg in "${COMMAND_ARGS[@]}"; do
+            if [[ "${arg}" == "-h" || "${arg}" == "--help" ]]; then
+                printf "Usage: ai-workspace refresh-coords [OPTIONS] [domain_name]\n\n"
+                printf "Automatically heals drifted symbol line coordinates across domain markdown files.\n"
+                exit 0
+            elif [[ "${arg}" == "-d" || "${arg}" == "--dry-run" ]]; then
+                export DRY_RUN=true
+            elif [[ -z "${target_dom}" && "${arg}" != -* ]]; then
+                target_dom="${arg}"
+            fi
+        done
+
+        resolve_workspace_env ""
+        refreshed_cnt="$(registry_refresh_coords "${target_dom}")"
+        if [[ "${refreshed_cnt}" -gt 0 && "${DRY_RUN}" == "false" ]]; then
+            log_success "Refreshed symbol coordinates in ${refreshed_cnt} domain(s)."
+        else
+            log_info "All symbol coordinates are up-to-date."
+        fi
+        ;;
+
+    sync)
+        diff_mode="--cached"
+        for arg in "${COMMAND_ARGS[@]}"; do
+            if [[ "${arg}" == "-h" || "${arg}" == "--help" ]]; then
+                printf "Usage: ai-workspace sync [OPTIONS] [DIFF_MODE]\n\n"
+                printf "Synchronizes staleness flags based on Git diff (--cached or commit range).\n"
+                exit 0
+            elif [[ "${arg}" == "-d" || "${arg}" == "--dry-run" ]]; then
+                export DRY_RUN=true
+            elif [[ "${arg}" != -* ]]; then
+                diff_mode="${arg}"
+            fi
+        done
+
+        resolve_workspace_env ""
+
+        if ! command -v git >/dev/null 2>&1 || ! git -C "${CODEBASE_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            exit 0
+        fi
+
+        if [[ "${DRY_RUN}" == "false" ]]; then
+            [[ ! -e "${CODEBASE_ROOT}/.ai" && -d "${AI_DIR}" ]] && ln -sfn "${AI_DIR}" "${CODEBASE_ROOT}/.ai"
+            [[ ! -e "${CODEBASE_ROOT}/AGENTS.md" && -f "${EXTERNAL_BASE}/AGENTS.md" ]] && ln -sfn "${EXTERNAL_BASE}/AGENTS.md" "${CODEBASE_ROOT}/AGENTS.md"
+        fi
+
+        if [[ "${diff_mode}" == "--cached" ]]; then
+            changed_raw="$(git -C "${CODEBASE_ROOT}" diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)"
+        else
+            changed_raw="$(git -C "${CODEBASE_ROOT}" diff "${diff_mode}" --name-only --diff-filter=ACMR 2>/dev/null || true)"
+        fi
+
+        mapfile -t changed_files < <(printf "%s\n" "${changed_raw}" | grep -E '\.(c|h|cpp|hpp|cc|cxx|py|sh|bash)$' || true)
+        if [[ ${#changed_files[@]} -eq 0 || -z "${changed_files[0]}" ]]; then
+            exit 0
+        fi
+
+        # Internal Seam: Call Knowledge Registry
+        modified_count="$(registry_mark_stale "${diff_mode}" "${changed_files[@]}")"
+        if [[ "${modified_count}" -gt 0 && "${DRY_RUN}" == "false" ]]; then
+            log_info "Synchronized ${modified_count} modified domain(s) to AI git repository."
+        fi
+        ;;
+
+    status)
+        resolve_workspace_env ""
+        registry_print_status
+        ;;
+
+    reindex)
+        for arg in "${COMMAND_ARGS[@]}"; do
+            if [[ "${arg}" == "-h" || "${arg}" == "--help" ]]; then
+                printf "Usage: ai-workspace reindex [OPTIONS]\n\n"
+                printf "Reconciles and synchronizes index.md with all domain markdown files.\n"
+                exit 0
+            elif [[ "${arg}" == "-d" || "${arg}" == "--dry-run" ]]; then
+                export DRY_RUN=true
+            fi
+        done
+
+        resolve_workspace_env ""
+        registry_reindex
+        ;;
+
+    help)
+        usage 0
+        ;;
+
+    *)
+        log_error "Unknown command: ${COMMAND}"
+        usage 1
+        ;;
+esac
